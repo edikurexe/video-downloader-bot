@@ -16,7 +16,6 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-TRACKER_URL = "http://localhost:5000"
 SHOPEE_URLS = [
     "https://s.shopee.co.id/8fOSavcGG9",   # Wipol Karbol
     "https://s.shopee.co.id/2qQfeIgImI",   # Kopi Kapal Api
