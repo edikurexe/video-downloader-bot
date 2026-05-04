@@ -39,6 +39,7 @@ FACEBOOK_PHOTO_PATTERN = re.compile(r'facebook\.com/(?:photo|.*?/photos/)', re.I
 GALLERY_DL = os.path.expanduser('~/.local/bin/gallery-dl')
 
 pending_downloads = {}  # {user_id: url}
+pending_wastory = {}    # {user_id: True} — waiting for video to compress
 rate_tracker = {}       # {user_id: [timestamps]}
 
 DB_PATH = Path(__file__).parent / "bot.db"
@@ -256,6 +257,84 @@ def download_tiktok_photos(url: str, output_dir: str) -> dict:
     return download_photos_gallery_dl(url, output_dir)
 
 
+# ─── WA Story Compress ────────────────────────────────────────────────────────
+
+def get_video_info(filepath: str) -> dict:
+    """Get video dimensions and duration using ffprobe."""
+    try:
+        result = subprocess.run(
+            ['ffprobe', '-v', 'quiet', '-print_format', 'json',
+             '-show_streams', '-show_format', filepath],
+            capture_output=True, text=True, timeout=15
+        )
+        import json
+        data = json.loads(result.stdout)
+        video_stream = next((s for s in data.get('streams', []) if s['codec_type'] == 'video'), {})
+        return {
+            'width': int(video_stream.get('width', 0)),
+            'height': int(video_stream.get('height', 0)),
+            'duration': float(data.get('format', {}).get('duration', 0)),
+        }
+    except:
+        return {'width': 0, 'height': 0, 'duration': 0}
+
+
+def compress_for_wa_story(input_path: str, output_path: str, mode: str = "original") -> dict:
+    """
+    Compress video for WA Story.
+    mode: 'portrait' (9:16, 720x1280), 'landscape' (16:9, 1280x720), 'original' (keep aspect, max 720p)
+    Returns: {'ok': bool, 'error': str, 'size': int}
+    """
+    info = get_video_info(input_path)
+    duration = info['duration']
+
+    # WA Story max 30 seconds
+    time_args = ['-t', '30'] if duration > 30 else []
+
+    # Calculate target bitrate for ~5MB target (safe for WA)
+    target_duration = min(duration, 30) if duration > 0 else 30
+    # Target ~4.5MB to leave room for audio
+    target_video_bitrate = int((4.5 * 8 * 1024) / target_duration)  # kbps
+    target_video_bitrate = max(800, min(target_video_bitrate, 2500))  # clamp 800-2500 kbps
+
+    if mode == "portrait":
+        # 720x1280 (9:16) — pad/crop to fit
+        vf = "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black"
+    elif mode == "landscape":
+        # 1280x720 (16:9) — pad/crop to fit
+        vf = "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black"
+    else:
+        # Original aspect ratio, max 720p height
+        vf = "scale='min(1280,iw)':min'(720,ih)':force_original_aspect_ratio=decrease"
+        # Simpler filter for original
+        vf = "scale='if(gt(iw,1280),1280,iw)':'if(gt(ih,720),720,ih)':force_original_aspect_ratio=decrease"
+
+    cmd = [
+        'ffmpeg', '-y', '-i', input_path,
+        *time_args,
+        '-vf', vf,
+        '-c:v', 'libx264', '-preset', 'medium', '-profile:v', 'baseline', '-level', '3.1',
+        '-b:v', f'{target_video_bitrate}k', '-maxrate', f'{int(target_video_bitrate * 1.2)}k',
+        '-bufsize', f'{target_video_bitrate * 2}k',
+        '-r', '30',
+        '-c:a', 'aac', '-b:a', '128k', '-ar', '44100',
+        '-movflags', '+faststart',
+        '-pix_fmt', 'yuv420p',
+        output_path
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            return {'ok': False, 'error': result.stderr[-300:]}
+        size = os.path.getsize(output_path)
+        return {'ok': True, 'size': size}
+    except subprocess.TimeoutExpired:
+        return {'ok': False, 'error': 'Compress timeout (>2 menit)'}
+    except Exception as e:
+        return {'ok': False, 'error': str(e)[:200]}
+
+
 # ─── yt-dlp opts ─────────────────────────────────────────────────────────────
 
 def get_ydl_opts(output_dir, quality="best", audio_only=False):
@@ -405,6 +484,25 @@ async def listvip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
+async def wastory_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Command /wastory — compress video for WA Story (Owner + VIP only)."""
+    user_id = update.effective_user.id
+    register_user(update.effective_user)
+
+    if user_id != OWNER_ID and not is_vip(user_id):
+        await update.message.reply_text("⛔ Fitur ini khusus untuk VIP ya~ Hubungi admin untuk info VIP.")
+        return
+
+    pending_wastory[user_id] = True
+    await update.message.reply_text(
+        "📱 *WA Story Compress*\n\n"
+        "Kirim videonya sekarang ya!\n"
+        "Aku akan compress biar pas dan jernih di WA Story.\n\n"
+        "_Menunggu video..._",
+        parse_mode="Markdown"
+    )
+
+
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         await update.message.reply_text("⛔ Kamu tidak punya akses ke sini ya~")
@@ -424,6 +522,109 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Pesan terkirim ke {success}/{len(users)} user.")
 
 # ─── Download Flow ────────────────────────────────────────────────────────────
+
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle video messages for WA Story compress."""
+    user_id = update.effective_user.id
+    register_user(update.effective_user)
+
+    if user_id not in pending_wastory:
+        return  # Not waiting for a video
+
+    video = update.message.video or update.message.document
+    if not video:
+        return
+
+    # Check mime type for documents
+    if update.message.document and not (video.mime_type or '').startswith('video/'):
+        return
+
+    del pending_wastory[user_id]
+
+    # Show orientation picker
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📱 Portrait (9:16)", callback_data=f"wastory_{user_id}_portrait"),
+            InlineKeyboardButton("🖥️ Landscape (16:9)", callback_data=f"wastory_{user_id}_landscape"),
+        ],
+        [
+            InlineKeyboardButton("📐 Original", callback_data=f"wastory_{user_id}_original"),
+        ],
+    ])
+
+    # Store file_id for later
+    pending_downloads[user_id] = {"wastory_file_id": video.file_id, "wastory_file_name": getattr(video, 'file_name', 'video.mp4')}
+
+    await update.message.reply_text(
+        "🎬 *Pilih orientasi untuk WA Story:*",
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+
+
+async def do_wastory_compress(message, file_id: str, file_name: str, user_id: int, mode: str):
+    """Download file from Telegram, compress, and send back."""
+    async def update_text(text):
+        await message.edit_text(text)
+
+    try:
+        await update_text("⏳ Mengunduh video...")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Download from Telegram
+            tg_file = await message._bot.get_file(file_id)
+            input_path = os.path.join(tmpdir, "input_" + (file_name or "video.mp4"))
+            await tg_file.download_to_drive(input_path)
+
+            # Get info
+            info = get_video_info(input_path)
+            dur_str = f"{info['duration']:.0f}s" if info['duration'] else "?"
+            res_str = f"{info['width']}x{info['height']}" if info['width'] else "?"
+
+            mode_label = {"portrait": "Portrait 9:16", "landscape": "Landscape 16:9", "original": "Original"}
+            await update_text(
+                f"🔄 Mengompress...\n"
+                f"📐 Mode: {mode_label.get(mode, mode)}\n"
+                f"📏 Asli: {res_str} | {dur_str}"
+            )
+
+            output_path = os.path.join(tmpdir, "wastory_output.mp4")
+            result = compress_for_wa_story(input_path, output_path, mode)
+
+            if not result['ok']:
+                await update_text(f"😔 Gagal compress: {result['error'][:200]}")
+                return
+
+            size_mb = result['size'] / (1024 * 1024)
+
+            if result['size'] > 50 * 1024 * 1024:
+                await update_text("😔 Hasil compress masih terlalu besar untuk Telegram (>50MB)")
+                return
+
+            await update_text("📤 Mengirim...")
+
+            out_info = get_video_info(output_path)
+            caption = (
+                f"✅ *WA Story Ready!*\n"
+                f"📐 {out_info['width']}x{out_info['height']} | {out_info['duration']:.0f}s\n"
+                f"📦 {size_mb:.1f} MB"
+            )
+
+            with open(output_path, 'rb') as f:
+                await message.reply_video(
+                    video=f,
+                    caption=caption,
+                    parse_mode="Markdown",
+                    supports_streaming=True
+                )
+
+            await message.delete()
+            log_download(user_id, "wastory_compress", f"WA Story ({mode})", "success")
+
+    except Exception as e:
+        await update_text(f"😢 Error: {str(e)[:200]}")
+        log_download(user_id, "wastory_compress", f"WA Story ({mode})", "failed")
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user)
@@ -506,6 +707,32 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
     data = query.data
+
+    # WA Story orientation picked
+    if data.startswith("wastory_"):
+        parts = data.split("_", 2)
+        if len(parts) == 3:
+            _, uid, mode = parts
+            if int(uid) != user_id:
+                await query.answer("❌ Bukan requestmu!", show_alert=True)
+                return
+
+            pending = pending_downloads.get(user_id)
+            if not pending or "wastory_file_id" not in pending:
+                await query.edit_message_text("😔 Request expired, kirim ulang /wastory ya~")
+                return
+
+            await query.answer()
+            await query.edit_message_text("⏳ Memproses...")
+            await do_wastory_compress(
+                query.message,
+                pending["wastory_file_id"],
+                pending.get("wastory_file_name", "video.mp4"),
+                user_id,
+                mode
+            )
+            pending_downloads.pop(user_id, None)
+            return
 
     # Tombol donasi
     if data.startswith("donate_"):
@@ -775,6 +1002,7 @@ async def post_init(app: Application):
     await app.bot.set_my_commands([
         BotCommand("start", "Mulai bot"),
         BotCommand("help", "Platform yang didukung"),
+        BotCommand("wastory", "Compress video untuk WA Story"),
         BotCommand("history", "5 download terakhirmu"),
         BotCommand("stats", "Statistik bot (owner only)"),
         BotCommand("broadcast", "Kirim pesan ke semua user (owner only)"),
@@ -791,7 +1019,9 @@ def main():
     app.add_handler(CommandHandler("addvip", addvip_command))
     app.add_handler(CommandHandler("delvip", delvip_command))
     app.add_handler(CommandHandler("listvip", listvip_command))
+    app.add_handler(CommandHandler("wastory", wastory_command))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler((filters.VIDEO | filters.Document.VIDEO) & ~filters.COMMAND, handle_video))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("✅ Bot started!")
     app.run_polling(drop_pending_updates=True)
